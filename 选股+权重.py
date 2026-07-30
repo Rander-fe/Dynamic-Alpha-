@@ -1,9 +1,15 @@
+# -*- coding: utf-8 -*-
 """
-持仓管理模块
+持仓管理模块（等权分配）
 ==================================================
 功能：
   1. 根据因子评分（rolling_score）生成月度调仓指令（monthly_positions）
   2. 回测中执行调仓（统一再平衡，支持权重分配）
+
+特点：
+  - 选中的股票采用**等权分配**（1/N），降低对评分精度的依赖
+  - 缓冲选股机制降低换手率
+  - T+1 开盘执行
 
 输入：因子评分文件（Parquet格式，含 composite_score）
 输出：月度持仓文件（Parquet/CSV，含 trade_date, ts_code, weight）
@@ -21,7 +27,7 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # 0. 路径配置
 # ============================================================
-PROJECT_ROOT = Path(r"C:/Users/haoran/Desktop/动态因子选股")
+PROJECT_ROOT = Path.cwd()
 DATA_DIR     = PROJECT_ROOT / "data"
 FACTOR_DIR   = DATA_DIR / "factors"
 SELECTION_DIR = DATA_DIR / "selection"
@@ -66,14 +72,14 @@ def get_next_trade_date(date, all_dates):
 
 
 # ============================================================
-# 3. 选股生成：从因子评分到月度持仓
+# 3. 选股生成：从因子评分到月度持仓（等权版）
 # ============================================================
 def generate_monthly_positions(score_file, log_file=None,
                                top_n=TOP_N, buffer=TURNOVER_BUFFER,
                                start_date=None, end_date=None,
                                output_dir=None):
     """
-    从因子评分文件生成月度持仓指令
+    从因子评分文件生成月度持仓指令（等权分配）
 
     参数
     ----
@@ -137,7 +143,7 @@ def generate_monthly_positions(score_file, log_file=None,
     ranking['has_score'] = ranking['composite_score'].notna()
     ranking = ranking[['date', 'year_month', 'symbol', 'composite_score', 'rank', 'has_score']]
 
-    # ---- 缓冲选股 ----
+    # ---- 缓冲选股（与原版逻辑一致） ----
     def select_with_buffer(month_df, prev_holdings):
         if month_df['composite_score'].isna().all():
             return None
@@ -185,19 +191,16 @@ def generate_monthly_positions(score_file, log_file=None,
                 prev_positions = None
                 continue
 
-        # Softmax 权重
-        sel_scores = group[group['symbol'].isin(selected)][['symbol', 'composite_score']].drop_duplicates('symbol')
-        scores = sel_scores['composite_score'].values
-        exp_scores = np.exp(scores - scores.max())
-        weight_arr = exp_scores / exp_scores.sum()
-        weight_map = dict(zip(sel_scores['symbol'], weight_arr))
+        # ★★★ 核心区别：等权分配，而非 Softmax ★★★
+        n_selected = len(selected)
+        equal_weight = 1.0 / n_selected
 
         for sym in selected:
             pos_list.append({'trade_date': trade_date, 'year_month': ym,
-                             'ts_code': sym, 'weight': weight_map[sym]})
+                             'ts_code': sym, 'weight': equal_weight})
 
         prev = set(selected)
-        prev_positions = [{'ts_code': s, 'weight': weight_map[s]} for s in selected]
+        prev_positions = [{'ts_code': s, 'weight': equal_weight} for s in selected]
 
     pos_df = pd.DataFrame(pos_list)
     print(f"[OK] 持仓生成：{len(pos_df):,} 条，覆盖 {pos_df['year_month'].nunique()} 个月")
@@ -205,8 +208,9 @@ def generate_monthly_positions(score_file, log_file=None,
         print(f"   零因子/无历史回退CSI300：{n_csi300} 个月")
 
     # ---- 保存 ----
-    ranking_file = output_dir / f"monthly_rankings_{score_file.stem.replace('rolling_score_','')}.parquet"
-    pos_file = output_dir / f"monthly_positions_{score_file.stem.replace('rolling_score_','')}.parquet"
+    stem = score_file.stem.replace('rolling_score_', '')
+    ranking_file = output_dir / f"monthly_rankings_{stem}.parquet"
+    pos_file = output_dir / f"monthly_positions_{stem}.parquet"
     ranking.to_parquet(ranking_file, index=False)
     pos_df.to_parquet(pos_file, index=False)
     print(f"[SAVE] 排名：{ranking_file}")
@@ -321,7 +325,7 @@ def main():
     all_pos = {}
     for st in SAMPLE_TYPES:
         print("\n" + "=" * 60)
-        print(f"📊 选股+权重 — {st.upper()}")
+        print(f"📊 选股+权重（等权）— {st.upper()}")
         print("=" * 60)
         score_file = get_score_file(st)
         log_file = get_selection_log_file(st)
@@ -344,13 +348,13 @@ def main():
         print("⚠️ 无任何样本数据可处理")
         return
 
-    # ---- 汇总 ---- 
+    # ---- 汇总 ----
     for st, pos_df in all_pos.items():
         print(f"\n{st}: {len(pos_df)} 条持仓，"
               f"{pos_df['trade_date'].nunique()} 个调仓日，"
-              f"{pos_df['ts_code'].nunique()} 只标的")
+              f"平均每期持仓 {len(pos_df) / pos_df['trade_date'].nunique():.1f} 只")
 
-    print("\n[OK] 全部完成！")
+    print("\n[OK] 全部完成！持仓文件已保存至 selection 目录。")
 
 
 if __name__ == "__main__":
