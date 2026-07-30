@@ -280,26 +280,34 @@ def run_backtest(sample_type, initial_capital=1_000_000, cost_rate=0.001):
         if nav_last > 0:
             daily_returns.append(nav / nav_last - 1)
         
-        # 回撤阶梯
-        if dd < -0.12:
+        # ---------- 自适应仓位管理（无硬编码阈值） ----------
+        if nav > peak_nav:
+            peak_nav = nav
+        dd = (nav - peak_nav) / peak_nav
+
+        if nav_last > 0:
+            daily_returns.append(nav / nav_last - 1)
+
+                # 回撤阶梯（收紧）
+        if dd < -0.18:
             dd_ratio = 0.40
-        elif dd < -0.08:
+        elif dd < -0.12:
             dd_ratio = 0.60
-        elif dd < -0.05:
+        elif dd < -0.07:
             dd_ratio = 0.80
         else:
             dd_ratio = 1.00
-        
-        # 波动率目标（15%）
+
+        # 波动率目标（12%）
         if len(daily_returns) >= 20:
             current_vol = np.std(daily_returns[-20:]) * np.sqrt(252)
         else:
             current_vol = 0.20
-        vol_ratio = 0.15 / current_vol if current_vol > 0 else 1.0
-        vol_ratio = np.clip(vol_ratio, 0.20, 1.0)
-        
+        vol_ratio = 0.12 / current_vol if current_vol > 0 else 1.0
+        vol_ratio = np.clip(vol_ratio, 0.30, 1.0)
+
         position_ratio = min(dd_ratio, vol_ratio)
-        
+
         # 记录
         nav_records.append({
             'date': date,
