@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 方案2 -- 混合方案: 家族预算 + IC衰减动态因子排序
 ==================================================
@@ -40,25 +39,26 @@ ML_LOG_OUTPUT_OUT = FACTOR_DIR / "rolling_selection_log_outsample.csv"
 
 START_DATE = "2021-01-01"
 END_DATE = "2026-06-30"
-IC_HALFLIFE = 63       # IC指数衰减半衰期
+IC_HALFLIFE = 42       # IC指数衰减半衰期
 LOOKBACK_DAYS = 252     # IC回溯期
 MIN_ABS_IC = 0.015      # |IC|筛选阈值
 
 EXCLUDE_COLS = [
     'ts_code', 'date', 'open', 'high', 'low', 'close', 'pre_close',
-    'change', 'pct_chg', 'vol', 'amount', 'name', 'daily_return',
-    'symbol', 'year_month'
+    'change', 'pct_chg', 'vol', 'amount', 'amount_billion',
+    'name', 'daily_return', 'symbol', 'year_month',
+    'float_share',
 ]
 
-# 因子家族分类
+# 因子家族分类（与创建因子.py 完全对齐，共7家族×31因子）
 FACTOR_FAMILIES = {
-    'momentum': ['momentum_', 'change'],
-    'quality': ['roe', 'grossprofit_margin', 'netprofit_yoy'],
-    'valuation': ['pe_ttm', 'pb', 'ps_ttm'],
-    'liquidity': ['turnover_rate', 'avg_turnover_', 'amount_billion', 'total_mv'],
+    'momentum': ['momentum_'],
+    'quality': ['roe', 'grossprofit_margin', 'netprofit_yoy', 'revenue_yoy', 'debt_to_assets'],
+    'valuation': ['pe_ttm', 'pb', 'ps_ttm', 'total_mv'],
+    'liquidity': ['turnover_rate', 'avg_turnover_'],
     'volatility': ['volatility_'],
     'drawdown': ['max_drawdown_'],
-    'technical': ['pre_close', 'volume_ratio'],
+    'technical': ['volume_ratio', 'volume_change'],
 }
 
 # 配额约束
@@ -72,11 +72,7 @@ QUOTA = {
     'technical': {'min': 0, 'max': 2},
 }
 
-# 默认家族预算（仅前240天预热期使用，取牛熊均值）
-FAMILY_BUDGET_DEFAULT = {
-    'momentum': 0.225, 'quality': 0.25, 'valuation': 0.10,
-    'liquidity': 0.10, 'volatility': 0.125, 'drawdown': 0.125, 'technical': 0.075,
-}
+
 
 
 def get_factor_family(name):
@@ -86,34 +82,161 @@ def get_factor_family(name):
     return 'technical'
 
 
-def get_dynamic_budget(current_date, bench_series):
-    """动态预算(同方案1)"""
-    hist = bench_series[bench_series.index <= current_date].tail(240)
-    if len(hist) < 240:
-        return FAMILY_BUDGET_DEFAULT, 0.0
 
-    ma240 = hist.mean()
-    price = hist.iloc[-1]
-    dev = (price - ma240) / ma240
+def compute_family_icir(ic_daily, factor_families, current_date=None, lookback=252):
+    """
+    计算各因子家族的 IC_IR（信息比率），并归一化为权重。
 
-    if price > ma240:
-        budget = {'momentum': 0.30, 'quality': 0.25, 'valuation': 0.10,
-                  'liquidity': 0.10, 'volatility': 0.05, 'drawdown': 0.10, 'technical': 0.10}
+    Parameters:
+        ic_daily: DataFrame，索引为日期，列为原始因子名，值为日频 IC
+        factor_families: 因子家族字典
+        current_date: 当前日期，若提供则剔除最近 IC_FORWARD_DAYS 避免未来函数
+        lookback: 回溯天数（默认 252）
+
+    Returns:
+        dict: {家族名: 权重}，权重和为 1
+    """
+    # 若指定 current_date，剔除最近 IC_FORWARD_DAYS 避免未来函数
+    if current_date is not None:
+        recent_cutoff = current_date - pd.offsets.BDay(IC_FORWARD_DAYS)
+        ic = ic_daily[ic_daily.index <= recent_cutoff]
     else:
-        budget = {'momentum': 0.15, 'quality': 0.25, 'valuation': 0.10,
-                  'liquidity': 0.10, 'volatility': 0.20, 'drawdown': 0.15, 'technical': 0.05}
+        ic = ic_daily
 
-    total = sum(budget.values())
-    return {k: v / total for k, v in budget.items()}, dev
+    family_icir = {}
+    for family, keywords in factor_families.items():
+        cols = [c for c in ic.columns if any(kw in c for kw in keywords)]
+        if not cols:
+            family_icir[family] = 0.0
+            continue
+
+        # 家族日频 IC = 内部因子 IC 的等权平均
+        family_ic = ic[cols].mean(axis=1, skipna=True)
+        hist = family_ic.dropna().tail(lookback)
+        if len(hist) < 60:
+            family_icir[family] = 0.0
+            continue
+
+        mean_ic = hist.mean()
+        std_ic = hist.std()
+        if std_ic == 0:
+            family_icir[family] = 0.0
+        else:
+            family_icir[family] = abs(mean_ic / std_ic)
+
+    total = sum(family_icir.values())
+    if total == 0:
+        n = len(factor_families)
+        return {fam: 1.0 / n for fam in factor_families}
+    else:
+        return {fam: val / total for fam, val in family_icir.items()}
+
+
+def get_market_regime(current_date, bench_series):
+    """
+    基于 MA60 与 MA120 判断当前市场状态。
+    返回: 'bull'（强势）, 'bear'（弱势）, 'neutral'（震荡）
+    """
+    hist = bench_series[bench_series.index <= current_date].tail(240)
+    if len(hist) < 120:
+        return 'neutral'
+
+    ma60 = hist.tail(60).mean()
+    ma120 = hist.tail(120).mean()
+    price = hist.iloc[-1]
+
+    if ma60 > ma120 and price > ma60:
+        return 'bull'
+    elif ma60 < ma120 and price < ma60:
+        return 'bear'
+    else:
+        return 'neutral'
+
+
+def _aggregate_family_ic(ic_daily, factor_families, lookback=252):
+    """将因子级IC聚合为家族级日频IC序列"""
+    family_ic = {}
+    for family, keywords in factor_families.items():
+        cols = [c for c in ic_daily.columns if any(kw in c for kw in keywords)]
+        if cols:
+            family_ic[family] = ic_daily[cols].mean(axis=1, skipna=True)
+    df = pd.DataFrame(family_ic).tail(lookback).dropna()
+    return df
+
+
+def _compute_ewma_covariance(values, halflife=63):
+    """计算EWMA协方差矩阵"""
+    lam = np.exp(np.log(0.5) / halflife)
+    n = len(values)
+    w = lam ** np.arange(n - 1, -1, -1)
+    w = w / w.sum()
+
+    demeaned = values - values.mean(axis=0)
+    cov = np.dot((w[:, np.newaxis] * demeaned).T, demeaned) / (1 - (w**2).sum())
+    return cov
+
+
+def _compute_gmv_weights(cov_matrix):
+    """GMV权重（全局最小方差）—— 使用伪逆增强数值稳定性"""
+    inv = np.linalg.pinv(cov_matrix.values)
+    ones = np.ones(len(cov_matrix))
+    w = inv @ ones / (ones @ inv @ ones)
+    return pd.Series(w, index=cov_matrix.index)
+
+
+def get_risk_budget_weights(ic_daily, factor_families, current_date=None,
+                             method='gmv', lookback=252, halflife=63):
+    """
+    计算风险平价/GMV权重（家族级别）。
+
+    Parameters:
+        ic_daily: DataFrame，索引为日期，列为原始因子名，值为日频IC
+        factor_families: 因子家族字典
+        current_date: 当前日期，若提供则剔除最近IC_FORWARD_DAYS避免未来函数
+        method: 'gmv'（全局最小方差）
+        lookback: 回溯天数
+        halflife: EWMA半衰期
+
+    Returns:
+        dict: {家族名: 权重}，权重和为1
+    """
+    if current_date is not None:
+        recent_cutoff = current_date - pd.offsets.BDay(IC_FORWARD_DAYS)
+        ic = ic_daily[ic_daily.index <= recent_cutoff]
+    else:
+        ic = ic_daily
+
+    family_ic_df = _aggregate_family_ic(ic, factor_families, lookback)
+    if len(family_ic_df) < 60:
+        n = len(factor_families)
+        return {fam: 1.0 / n for fam in factor_families}
+
+    cov = _compute_ewma_covariance(family_ic_df.values, halflife)
+    cov_df = pd.DataFrame(cov, index=family_ic_df.columns, columns=family_ic_df.columns)
+
+    w = _compute_gmv_weights(cov_df)
+    w = w.clip(0)          # 截断负权重
+    w = w / w.sum()        # 归一化
+    return w.to_dict()
+
+
+# IC基于shift(-20)前向收益，最近20个交易日的IC含有未来信息，需剔除
+IC_FORWARD_DAYS = 20
 
 
 def compute_ewm_ic_weights(ic_daily, current_date, factor_list):
     """
     对每个因子计算过去LOOKBACK_DAYS的IC指数衰减加权平均
     返回: {factor: smoothed_ic}
+
+    注意: 因IC使用shift(-20)前向收益计算，故剔除最近IC_FORWARD_DAYS天数据，
+          避免前向收益跨越current_date造成未来函数。
     """
-    cutoff = current_date - pd.Timedelta(days=LOOKBACK_DAYS)
-    hist = ic_daily[(ic_daily.index <= current_date) & (ic_daily.index > cutoff)]
+    # 最远回溯边界（交易日，与LOOKBACK_DAYS=252交易日保持一致）
+    cutoff = current_date - pd.offsets.BDay(LOOKBACK_DAYS)
+    # 最近剔除边界: 最后IC_FORWARD_DAYS个交易日(前向收益窗口)不可用
+    recent_cutoff = current_date - pd.offsets.BDay(IC_FORWARD_DAYS)
+    hist = ic_daily[(ic_daily.index <= recent_cutoff) & (ic_daily.index > cutoff)]
 
     result = {}
     for fc in factor_list:
@@ -241,8 +364,41 @@ def hybrid_scoring(factor_df, ic_daily, bench_series, label="",
             for f, w in picks:
                 selected_factors[f] = w
 
-        # 3. 获取动态预算
-        budget, dev = get_dynamic_budget(last_date, bench_series)
+        # ========== 新预算逻辑：ICIR + 风险平价混合 ==========
+
+        # 3a. 计算 ICIR 权重（家族级别）
+        icir_weights = compute_family_icir(ic_daily, FACTOR_FAMILIES,
+                                           current_date=last_date, lookback=252)
+
+        # 3b. 计算风险平价权重（家族级别，GMV方法）
+        rp_weights = get_risk_budget_weights(ic_daily, FACTOR_FAMILIES,
+                                              current_date=last_date, method='gmv')
+
+        # 3c. 判断市场状态（用于决定混合比例）
+        regime = get_market_regime(last_date, bench_series)
+
+        if regime == 'bull':
+            alpha = 0.95      # 牛市：近乎纯 ICIR，GMV 拖累降到最低
+        elif regime == 'bear':
+            alpha = 0.25      # 熊市：重风险平价（强防御）
+        else:
+            alpha = 0.55      # 震荡：略偏 ICIR
+
+        # 3d. 混合权重
+        all_fams = set(icir_weights.keys()) | set(rp_weights.keys())
+        mixed = {}
+        for fam in all_fams:
+            icir_w = icir_weights.get(fam, 0.0)
+            rp_w = rp_weights.get(fam, 0.0)
+            mixed[fam] = alpha * icir_w + (1 - alpha) * rp_w
+
+        # 归一化
+        total_mix = sum(mixed.values())
+        if total_mix > 0:
+            budget = {k: v / total_mix for k, v in mixed.items()}
+        else:
+            n = len(all_fams)
+            budget = {fam: 1.0 / n for fam in all_fams}
 
         # 4. 按家族分组, 分配家族内权重
         # 因子权重 = 家族预算 * (|因子IC| / 家族内|IC|之和)
@@ -291,14 +447,14 @@ def hybrid_scoring(factor_df, ic_daily, bench_series, label="",
             'factors': ','.join(active_factors[:8]),
             'fallback': False, 'zero_factor': len(active_factors) == 0,
             'model': 'Hybrid',
-            'budget': 'bull' if dev > 0 else 'bear',
+            'budget': f'alpha={alpha:.2f}',
             'top_ic_factor': max(selected_factors, key=lambda x: abs(selected_factors[x])) if selected_factors else ''
         })
 
         if (month_idx + 1) % 12 == 0 or month_idx == total_months - 1:
             n_active = len(active_factors)
             fam_info = {fam: len([f for f in active_factors if get_factor_family(f) == fam]) for fam in FACTOR_FAMILIES}
-            print(f"   [{month_idx+1}/{total_months}] {str(ym)} | {n_active}因子 | regime={'bull' if dev>0 else 'bear'} | {fam_info}")
+            print(f"   [{month_idx+1}/{total_months}] {str(ym)} | {n_active}因子 | alpha={alpha:.2f} | {fam_info}")
 
     scored_df = pd.concat(scored_list, ignore_index=True)
     scored_df['date'] = pd.to_datetime(scored_df['date'])
